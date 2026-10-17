@@ -1,15 +1,22 @@
+import requests
+import json
 import os
-import sys
-from dataclasses import asdict, dataclass
+import logging
+import socket
+import ipaddress
+from urllib.parse import urlparse
 from enum import Enum
 from typing import Dict, List, Optional, Tuple, Union
-
-import requests
-from pypushdeer import PushDeer
+from dataclasses import dataclass, asdict
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-
 from logging_config import init_logger
+
+# pypushdeer 仅在 Actions/已安装环境下可用；纯 TG ZIP 部署可不安装
+try:
+    from pypushdeer import PushDeer
+except ImportError:
+    PushDeer = None
 
 
 class CheckinStatus(Enum):
@@ -52,9 +59,10 @@ class LogEmoji:
     END = "🏁"
     COOKIE = "🍪"
     DOMAIN = "🌐"
-    WARNING = "⚠️"
+    WARNING = "⚠️ "
     ERROR = "🔴"
-    INFO = "ℹ️"
+    INFO = "ℹ️ "
+    TELEGRAM = "📨"
 
 
 def log_method(func):
@@ -94,6 +102,14 @@ def log_method(func):
     return wrapper
 
 
+def is_public_ip(addr) -> bool:
+    """服务端请求地址校验：localhost/环回/私有/保留地址视为不安全"""
+    return not (
+        addr.is_private or addr.is_loopback or addr.is_link_local
+        or addr.is_multicast or addr.is_reserved or not addr.is_global
+    )
+
+
 class Config:
     """应用配置"""
 
@@ -101,6 +117,12 @@ class Config:
     ENV_COOKIES = "GLADOS_COOKIES"
     ENV_EXCHANGE_PLAN = "GLADOS_EXCHANGE_PLAN"
     ENV_VERBOSE = "GLADOS_VERBOSE"
+    ENV_TG_BOT_TOKEN = "TG_BOT_TOKEN"
+    ENV_TG_CHAT_ID = "TG_CHAT_ID"
+    ENV_TG_API_URL = "TG_API_URL"
+
+    """Telegram Bot API 官方地址（TG_API_URL 留空时使用）"""
+    DEFAULT_TG_API_URL = "https://api.telegram.org"
 
     """默认兑换计划（none 表示不自动兑换）"""
     DEFAULT_EXCHANGE_PLAN = "none"
@@ -120,6 +142,9 @@ class Config:
 
     def __init__(self):
         self.push_key: str = ""
+        self.tg_bot_token: str = ""
+        self.tg_chat_id: str = ""
+        self.tg_api_url: str = self.DEFAULT_TG_API_URL
         self.cookies_list: List[str] = []
         self.exchange_plan: str = self.DEFAULT_EXCHANGE_PLAN
         self.verbose: bool = self.DEFAULT_VERBOSE
@@ -131,12 +156,33 @@ class Config:
         raw_cookies_env: Optional[str] = os.environ.get(self.ENV_COOKIES)
         exchange_plan_env: Optional[str] = os.environ.get(self.ENV_EXCHANGE_PLAN)
         verbose_env: Optional[str] = os.environ.get(self.ENV_VERBOSE)
+        tg_token_env: Optional[str] = os.environ.get(self.ENV_TG_BOT_TOKEN)
+        tg_chat_env: Optional[str] = os.environ.get(self.ENV_TG_CHAT_ID)
+        tg_api_env: Optional[str] = os.environ.get(self.ENV_TG_API_URL)
 
         if not push_key_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_PUSH_KEY}' 未设置。")
             self.push_key = ""
         else:
             self.push_key = push_key_env
+
+        self.tg_bot_token = tg_token_env.strip() if tg_token_env else ""
+        if not self.tg_bot_token:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_TG_BOT_TOKEN}' 未设置。")
+
+        self.tg_chat_id = tg_chat_env.strip() if tg_chat_env else ""
+        if not self.tg_chat_id:
+            logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_TG_CHAT_ID}' 未设置。")
+
+        self.tg_api_url = self._normalize_tg_api_url(tg_api_env)
+        if tg_api_env and not self.tg_api_url:
+            raise ValueError(f"环境变量 '{self.ENV_TG_API_URL}' 已设置，但不是合法的 HTTP(S) 接口地址: {tg_api_env}")
+
+        if self.tg_api_url:
+            if self.tg_api_url != self.DEFAULT_TG_API_URL:
+                logger.info(f"{LogEmoji.INFO} 使用自定义 Telegram API 地址: {self.tg_api_url}")
+            if not self.tg_configured:
+                logger.warning(f"{LogEmoji.WARNING} 已配置 '{self.ENV_TG_API_URL}'，但 '{self.ENV_TG_BOT_TOKEN}' / '{self.ENV_TG_CHAT_ID}' 未设置完整，Telegram 推送将跳过。")
 
         if not raw_cookies_env:
             logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_COOKIES}' 未设置。")
@@ -171,6 +217,53 @@ class Config:
                 logger.warning(f"{LogEmoji.WARNING} 环境变量 '{self.ENV_VERBOSE}' 的值 '{verbose_env}' 无效，将使用默认值 {self.DEFAULT_VERBOSE}。")
 
         logger.info(f"{LogEmoji.INFO} 当前 {self.ENV_VERBOSE}: {self.verbose}。")
+
+    @property
+    def tg_configured(self) -> bool:
+        """是否已完整配置 Telegram 推送"""
+        return bool(self.tg_bot_token and self.tg_chat_id)
+
+    @staticmethod
+    def _normalize_tg_api_url(raw: str) -> str:
+        """归一化 TG_API_URL；留空回退默认官方地址，非法返回 ''（上层报错）"""
+        raw_str = (raw or "").strip()
+        if not raw_str:
+            return Config.DEFAULT_TG_API_URL
+
+        # 省略协议时默认按 https 处理；bot token 不允许明文传输，仅允许 https
+        if not raw_str.lower().startswith(("http://", "https://")):
+            raw_str = "https://" + raw_str
+
+        try:
+            parsed = urlparse(raw_str)
+        except ValueError:
+            return ""
+
+        # 不允许携带 user:pass@ 信息（SSRF 伪装手法）
+        if parsed.username or parsed.password:
+            return ""
+
+        if parsed.scheme != "https" or not parsed.hostname:
+            return ""
+
+        # 拒绝 localhost/环回/私有/保留的 IP 直写形式
+        try:
+            candidate = ipaddress.ip_address(parsed.hostname.lower())
+        except ValueError:
+            candidate = None
+        if candidate is not None and not is_public_ip(candidate):
+            return ""
+
+        # 域名形态：拒绝环回区、保留域名与无点主机名（如内网服务名）
+        if candidate is None:
+            hostname = parsed.hostname.lower()
+            if hostname == "localhost" or "." not in hostname:
+                return ""
+            if hostname.endswith((".localhost", ".local", ".internal", ".test", ".example", ".invalid", ".lan", ".home", ".localdomain", ".intranet")):
+                return ""
+
+        # 保留自建 API 转发器的多级路径
+        return f"{parsed.scheme}://{parsed.netloc}{parsed.path}".rstrip("/")
 
 
 # 各平台合法 User-Agent（版本号无关，仅平台 token 关键）
@@ -242,8 +335,7 @@ class API:
     def _log(self, level: str, emoji: str, message: str, force: bool = False) -> None:
         """统一日志输出方法"""
 
-        prefix = f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}]"
-        log_message = f"{prefix} {emoji} {message}"
+        log_message = f"{LogEmoji.COOKIE}[{self.cookie_index}] {LogEmoji.DOMAIN}[{self.domain}] {emoji} {message}"
 
         if force or self.verbose:
             if level == "info":
@@ -357,21 +449,7 @@ class API:
             result["points"] = "0"
             result["message"] = message
         else:
-            # 失败分支：按 code 细分诊断，便于快速定位根因
-            if code == 4:
-                reason = raw.get("reason")
-                if reason == "device-mismatch":
-                    login_device = raw.get("loginDevice") or "未知"
-                    if login_device in PLATFORM_UA:
-                        self._log("error", LogEmoji.ERROR, f"设备平台不匹配(loginDevice={login_device})，重试后仍失败，请确认登录设备平台", force=True)
-                    else:
-                        self._log("error", LogEmoji.ERROR, f"设备平台不匹配(loginDevice={login_device} 不在支持列表)，无法自动切换 UA；请提交相关截图到本项目 issue 以便作者更新设备列表", force=True)
-                else:
-                    self._log("error", LogEmoji.ERROR, f"服务端拒绝签到(code=4, reason={reason})，请检查账户风控状态", force=True)
-            elif code == -2:
-                self._log("error", LogEmoji.ERROR, f"无权限(code=-2)：Cookie 可能已失效，请重新登录 {self.domain} 刷新 Cookie 并更新仓库 Secret GLADOS_COOKIES 后重试", force=True)
-            else:
-                self._log("error", LogEmoji.ERROR, f"未预期响应(code={code}, message={message})，请检查 GLaDOS 服务状态或 Cookie", force=True)
+            self._log("info", LogEmoji.FAIL, f"{{ code : {code}, message : {message} }}", force=True)
             result["code"] = CheckinStatus.FAILURE
             result["status"] = "签到失败"
             result["points"] = "0"
@@ -396,10 +474,10 @@ class API:
                 self._log("info", LogEmoji.SUCCESS, f"{{ code : {code}, leftDays : {left_days_int} 天}}")
                 return f"{left_days_int} 天", code
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}")
+                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, leftDays : {left_days} 天}}", force=True)
                 return "None 天", code
         else:
-            self._log("warning", LogEmoji.WARNING, "获取状态失败")
+            self._log("warning", LogEmoji.WARNING, "获取状态失败", force=True)
             return "None 天", -2
 
     @log_method
@@ -420,10 +498,10 @@ class API:
                 points_num = points_int
                 return points_str, points_num
             else:
-                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}")
+                self._log("info", LogEmoji.FAIL, f"{{ code : {code}, points : {points} 积分}}", force=True)
                 return "None 积分", 0
         else:
-            self._log("warning", LogEmoji.WARNING, "获取积分失败")
+            self._log("warning", LogEmoji.WARNING, "获取积分失败", force=True)
             return "None 积分", 0
 
     @log_method
@@ -469,23 +547,114 @@ class CheckinResult:
 class PushService:
     """推送服务"""
 
+    # Telegram sendMessage 单条消息上限 4096 字符，分段时每段留出余量
+    TG_CHUNK_SIZE = 3800
+    TG_SEND_TIMEOUT: Tuple[float, float] = (10, 30)
+
     def __init__(self, config: Config):
         self.config = config
 
     def send(self, title: str, content: str) -> bool:
-        """发送推送"""
-        if not self.config or not getattr(self.config, "push_key", ""):
-            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过推送通知。")
+        """发送推送（PushDeer 与 Telegram 各自独立分发、互不影响）"""
+        sent = False
+
+        if self.config.push_key:
+            sent = self._send_pushdeer(title, content) or sent
+        else:
+            logger.info(f"{LogEmoji.WARNING} 未设置推送密钥，跳过 PushDeer 推送。")
+
+        if self.config.tg_configured:
+            sent = self._send_telegram(title, content) or sent
+        else:
+            logger.info(f"{LogEmoji.WARNING} 未配置 '{self.config.ENV_TG_BOT_TOKEN}' / '{self.config.ENV_TG_CHAT_ID}'，跳过 Telegram 推送。")
+
+        return sent
+
+    def _send_pushdeer(self, title: str, content: str) -> bool:
+        """通过 PushDeer 发送推送"""
+        if PushDeer is None:
+            logger.error(f"{LogEmoji.ERROR} 本地环境未安装 pypushdeer，跳过 PushDeer 推送。")
             return False
 
         try:
             pushdeer = PushDeer(pushkey=self.config.push_key)
             pushdeer.send_text(title, desp=content)
-            logger.info(f"{LogEmoji.SUCCESS} 推送通知发送成功。")
+            logger.info(f"{LogEmoji.SUCCESS} PushDeer 推送发送成功。")
             return True
         except Exception as e:
-            logger.error(f"{LogEmoji.ERROR} 发送推送通知失败: {e}")
+            logger.error(f"{LogEmoji.ERROR} PushDeer 推送发送失败: {e}")
+        return False
+
+    def _send_telegram(self, title: str, content: str) -> bool:
+        """通过 Telegram Bot API 发送推送，超长内容自动分段"""
+        text = f"{title}\n\n{content}" if content else title
+        base_url = f"{self.config.tg_api_url}/bot{self.config.tg_bot_token}/sendMessage"
+        payload = {"chat_id": self.config.tg_chat_id, "text": text}
+
+        try:
+            if len(text) <= 4000:
+                return self._tg_send_request(base_url, payload)
+
+            chunks = [text[off:off + self.TG_CHUNK_SIZE] for off in range(0, len(text), self.TG_CHUNK_SIZE)]
+            logger.info(f"{LogEmoji.INFO} 推送内容超长，拆分为 {len(chunks)} 段发送。")
+            for idx, chunk in enumerate(chunks, 1):
+                fragment_payload: Dict = dict(payload, text=chunk)
+                fragment_label = "" if idx == 1 else f"（续 {idx}/{len(chunks)}）"
+                if not self._tg_send_request(base_url, fragment_payload, fragment_label):
+                    return False
+            return True
+        except Exception as e:
+            logger.error(f"{LogEmoji.ERROR} Telegram 推送发送失败: {e}")
+        return False
+
+    def _tg_send_request(self, base_url: str, payload: Dict, fragment_label: str = "") -> bool:
+        """发送 sendMessage 请求（内联 SSRF 防护：https 白名单 + 主机公网边界 + 禁重定向）"""
+        # --- 至此进入服务端请求统一做 SSRF 校验 ---
+        parsed = urlparse(base_url)
+
+        # 协议白名单：仅允许 https（bot token 不允许走明文 http）
+        if parsed.scheme != "https":
+            logger.error(f"{LogEmoji.ERROR} 仅允许 https 的 Telegram API 地址，跳过推送。")
             return False
+
+        # 主机合法性：必须存在主机名；不允许携带 user:pass@ 信息形态
+        host = (parsed.hostname or "").lower()
+        if not host or "@" in parsed.netloc:
+            logger.error(f"{LogEmoji.ERROR} Telegram API 地址主机名非法，跳过推送。")
+            return False
+
+        # 解析主机全部 IP，阻断 localhost / 环回 / 私网 / 链路本地 / 保留段（防 DNS rebinding）
+        try:
+            resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM, socket.IPPROTO_TCP)
+        except OSError as e:
+            logger.error(f"{LogEmoji.ERROR} Telegram API 主机解析失败: {e}")
+            return False
+        for info in resolved:
+            try:
+                addr = ipaddress.ip_address(info[4][0])
+            except ValueError:
+                logger.error(f"{LogEmoji.ERROR} Telegram API 主机解析出异常地址，跳过推送。")
+                return False
+            if not is_public_ip(addr):
+                logger.error(f"{LogEmoji.ERROR} Telegram API 主机解析到非公网地址，跳过推送。")
+                return False
+
+        # allow_redirects=False：30x 重定向可能被引导到内网地址，直接禁用
+        response = requests.post(
+            base_url,
+            json=payload,
+            timeout=self.TG_SEND_TIMEOUT,
+            allow_redirects=False,
+        )
+
+        if response.ok:
+            logger.info(f"{LogEmoji.SUCCESS} Telegram 推送发送成功{fragment_label}。")
+            return True
+
+        logger.error(
+            f"{LogEmoji.ERROR} Telegram 推送发送失败{fragment_label}: 状态码 {response.status_code}, 响应: {response.text}"
+        )
+        return False
 
 
 class Checker:
@@ -560,7 +729,7 @@ class Checker:
                 result.exchange = api.exchange(cookie, self.config.exchange_plan, required_points)
             else:
                 result.exchange = "未配置兑换计划，跳过自动兑换"
-                self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换")
+                self._log(cookie_idx, domain, LogEmoji.INFO, "未配置兑换计划，跳过自动兑换", force=True)
 
         return result
 
@@ -576,23 +745,19 @@ class Checker:
         repeat_count = sum(1 for r in results if r["code"] == CheckinStatus.REPEAT)
         fail_count = sum(1 for r in results if r["code"] == CheckinStatus.FAILURE)
 
-        status_emoji_map = {
-            CheckinStatus.SUCCESS: LogEmoji.SUCCESS,
-            CheckinStatus.REPEAT: LogEmoji.REPEAT,
-            CheckinStatus.FAILURE: LogEmoji.ERROR,
-        }
-        title = f"GLaDOS 签到 · 成功 {success_count} · 失败 {fail_count} · 重复 {repeat_count}"
+        title = f"GLaDOS 签到, 成功{success_count}, 失败{fail_count}, 重复{repeat_count}"
 
         send_content_lines = []
         log_content_lines = []
         for i, res in enumerate(results, 1):
-            emoji = status_emoji_map.get(res["code"], LogEmoji.ERROR)
-            domain = res["domain"]
-            detail = f"获得 {res['points']} 积分 · 剩余 {res['days']} · 总 {res['points_total']} · {res['exchange']}"
-            log_line = f"#{i:<2}  {emoji} {res['status']:<6}  {domain:<13}  {detail if self.config.verbose else ''}".rstrip()
+            line = f"#{i} P:{res['points']} 剩余:{res['days']} 总积分:{res['points_total']} | {res['status']} | {res['exchange']}"
+            send_content_lines.append(line)
+
+            if self.config.verbose:
+                log_line = line
+            else:
+                log_line = f"#{i} {res['status']}"
             log_content_lines.append(log_line)
-            send_line = f"#{i:<2}  {emoji} {res['status']:<6}  {domain:<13}  {detail}"
-            send_content_lines.append(send_line)
 
         content = "\n".join(send_content_lines)
         log_content = "\n".join(log_content_lines)
@@ -605,7 +770,6 @@ logger = init_logger()
 
 def main():
     """主函数"""
-    exit_code = 0
     try:
         # 1. 加载配置
         logger.info(f"{LogEmoji.START} 步骤 1: 加载配置")
@@ -623,21 +787,17 @@ def main():
             # 3. 格式化结果
             logger.info(f"{LogEmoji.START} 步骤 3: 格式化结果")
             title, content, log_content = checker.format_results()
-            logger.info(f"\n{LogEmoji.END} ========== 签到总结 ==========\n{title}\n{log_content}")
+            logger.info(f"\n{LogEmoji.END}========== 签到总结 ==========\n{title}\n{log_content}")
 
     except Exception as e:
         logger.error(f"{LogEmoji.ERROR} 主程序执行过程中发生未预期的错误: {e}")
-        title, content = "# 脚本执行出错", str(e)
-        exit_code = 1
+        title, content, log_content = "# 脚本执行出错", str(e), str(e)
 
     # 4. 发送推送
     logger.info(f"{LogEmoji.START} 步骤 4: 发送推送")
-    push_service = PushService(config if "config" in locals() else None)
+    push_service = PushService(config if "config" in locals() else "")
     push_service.send(title, content)
     logger.info(f"{LogEmoji.END} 签到完成")
-
-    if exit_code != 0:
-        sys.exit(exit_code)
 
 
 if __name__ == "__main__":
